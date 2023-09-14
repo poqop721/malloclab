@@ -36,7 +36,7 @@ team_t team = {
 };
 
 /* single word (4) or double word (8) alignment */
-#define ALIGNMENT 8
+#define ALIGNMENT 16
 
 /* rounds up to the nearest multiple of ALIGNMENT @@@*/
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
@@ -75,28 +75,47 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char * )(bp) - WSIZE))) //다음 bp를 가리킴
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char * )(bp) - DSIZE))) // 이전 bp를 가리킴
 
+/*void**는 void형 포인터의 주소를 저장한다.
+void*는 자료형에 관계없이 주소값을 대입할 수 있는 포인터, 
+void**는 그 void형 포인터의 주소를 가리킴.
+void** 는 void*를 가리키며 void*는 포인터형 변수이므로 4byte의 크기를 가진다.
+*(void**) => void형 포인터의 주소의 값 => 4byte
+*/
+#define PREV(bp) (*(void**)(bp)) // bp는 prev를 가리킴.
+#define NEXT(bp) (*(void**)(bp + WSIZE))// 위 + WSIZE
+
 static void *heap_listp;
-static char *next_listp;  // 이전 검색이 종려된 지점(Next Fit)
+static char *free_listp; // free list head - 가용리스트 시작부분  
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 static void *find_fit(size_t a_size);
 static void place(void *bp, size_t a_size);
+void removeBlock(void *bp);
+void putFreeBlock(void *bp);
 
-/* 
+
+/*
  * mm_init - initialize the malloc package. 할당기 초기화
  시스템에서 4워드를 가져와서 빈 가용 리스트를 만들 수 있도록 초기화
  */
 int mm_init(void)
 {
     /*create the initial empty heap*/
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *) -1)
+    /* padding 4byte(1byte는 alloc) + 프롤로그 헤더 4byte / prev(4byte) + next(4byte)
+    /프롤로그 풋터 4byte + 에필로그 헤더 4byte / => 24byte
+    */
+    if ((heap_listp = mem_sbrk(6*WSIZE)) == (void *) -1) // 24byte
         return -1;
 
+    //[ padding | p.h | prev | next | p.f | e.h ]
     PUT(heap_listp,0); //align padding - [0|p.h|p.f|e.h] 이렇게 더블 워드 조건을 만족시키기 위해. 이후 expand heap을 해도 차피 2워드씩 들어오니까.
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE,1)); //프롤로그 헤더
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE,1)); //프롤로그 풋터
-    PUT(heap_listp + (3*WSIZE), PACK(0, 1)); //에필로그 헤더
-    heap_listp += (2*WSIZE); //payload를 가리킴.
+    PUT(heap_listp + (1*WSIZE), PACK(ALIGNMENT,1)); //프롤로그 헤더 16/1
+    PUT(heap_listp + (2*WSIZE), 0); //프롤로그 PREV 포인터 NULL로 초기화
+    PUT(heap_listp + (3*WSIZE), 0); //프롤로그 NEXT 포인터 NULL로 초기화
+    PUT(heap_listp + (4*WSIZE), PACK(ALIGNMENT, 1)); //프롤로그 풋터 16/1
+    PUT(heap_listp + (5*WSIZE), PACK(0, 1)); //에필로그 헤더 0/1
+
+    free_listp = heap_listp + DSIZE; // free_listp 가 prev 포인터를 가리키게 초기화
 
     /*Extend the empty heap with a free block of CHUNKSIZE bytes*/
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL) // CHUNKSIZE 바이트를 워드 사이즈로 변환(인자가 word라서)
@@ -142,13 +161,11 @@ static void *coalesce(void *bp)
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp))); //다음 블록의 헤더를 통해 다음 블록이 할당되었는지.
     size_t size = GET_SIZE(HDRP(bp)); // 현재 블록의 사이즈
 
-    /*case 1 - 전후 다 할당*/
-    if(prev_alloc && next_alloc){
-        return bp;
-    }
+    /*(case 1 - 전후 다 할당) 삭제. -> 가용 블록이 없으면 조건을 추가할 필요가 없음. 맨 밑에서 root에 삽입함*/
 
     /*case 2 - 전은 할당, 후는 비할당*/
-    else if(prev_alloc && !next_alloc){
+    if(prev_alloc && !next_alloc){
+        removeBlock(NEXT_BLKP(bp)); //
         size += GET_SIZE(HDRP(NEXT_BLKP(bp))); //현재 size + 다음 size
         PUT(HDRP(bp), PACK(size,0));
         PUT(FTRP(bp), PACK(size,0));
@@ -156,22 +173,27 @@ static void *coalesce(void *bp)
 
     /*case 3 전 비할당, 후 할당*/
     else if(!prev_alloc && next_alloc){
+        removeBlock(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))); //현재 size + 이전 size
         PUT(FTRP(bp), PACK(size,0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size,0));
         bp = PREV_BLKP(bp); // bp는 이전 블록의 payload를 가리키게
-
+        // bp = PREV_BLKP(bp);
+        // PUT(HDRP(bp), PACK(size,0));
+        // PUT(FTRP(bp), PACK(size,0));
     }
 
     /*case 4 전후 다 비할당*/
-    else{
+    else if(!prev_alloc && !next_alloc){
+        removeBlock(PREV_BLKP(bp));
+        removeBlock(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
         //현재 size + 이전 size + 다음 size
         PUT(HDRP(PREV_BLKP(bp)), PACK(size,0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size,0));
         bp = PREV_BLKP(bp); // bp는 이전 블록의 payload를 가리키게
     }
-    next_listp = bp;
+    putFreeBlock(bp); // 연결이 된 블록을 free list 에 추가
     return bp;
 }
 
@@ -182,12 +204,12 @@ static void *coalesce(void *bp)
  */
 void *mm_malloc(size_t size)
 {
-    size_t asize;
+    size_t asize;//할당할 블록 사이즈
     size_t extendsize;
-    char *bp;
+    void *bp;
 
     /*Ignore spurious requests*/
-    if(size == 0)
+    if(size <= 0)
         return NULL;
     
     /*adjust block size to include overhead and alignment reqs.*/
@@ -218,50 +240,27 @@ void *mm_malloc(size_t size)
 }
 
 
-// // First Fit
-// static void *find_fit(size_t asize) {
-//     void *bp;
-
-//     //(heap_list 의 처음(시작주소)부터;블록 사이즈가 0보다 클 동안;bp는 다음 블록으로 넘어가면서)
-//     for (bp = (char *)heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
-//         //블록이 할당되어있지 않으면서, 내가 요청한 size보다 클 때 => 적합
-//         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-//             return bp;
-//         }
-//     }
-//     return NULL;    // NO fit
-// }
-
-
-// Next Fit
-static void *find_fit(size_t asize)
-{
-    if (next_listp==NULL){ //이전에 발견된 지점이 없을 때
-        next_listp = heap_listp; // 힙의 처음부터 검색
-    }
+// First Fit
+static void *find_fit(size_t asize) {
     void *bp;
-    /*search from last points to end of the free*/
-    for (bp=next_listp; GET_SIZE(HDRP(bp)) >0; bp=NEXT_BLKP(bp)){
-        if(!GET_ALLOC(HDRP(bp))&&(asize <= GET_SIZE(HDRP(bp)))){ // 다음 블록이 할당도 안 되어있고 사이즈도 적합하면
-            //검색 종료 지점 남김
-            return bp;
-        }
-    }
 
-    /*이전 검색 지점부터 끝까지 없다면, 다시 처음부터 이전 검색 지점까지 검색*/
-    for (bp=heap_listp; HDRP(bp) != HDRP(next_listp); bp=NEXT_BLKP(bp)){
-        if(!GET_ALLOC(HDRP(bp))&&(asize <= GET_SIZE(HDRP(bp)))){
-            //검색 종료 지점 남김
+    //가용리스트의 시작부터;할당이 안 됐을 동안;bp는 다음 블록으로 넘어가면서)
+    for (bp = free_listp; GET_ALLOC(HDRP(bp)) != 1; bp = NEXT(bp)) {
+        //내가 요청한 size보다 클 때 => 적합
+        if (asize <= GET_SIZE(HDRP(bp))) {
             return bp;
         }
     }
-    return NULL; /*no fit*/
+    return NULL;    // NO fit
 }
-
 
 // 요청한 블록을 배치, 필요한 경우 블록 분할
 static void place(void *bp, size_t a_size) {
     size_t c_size = GET_SIZE(HDRP(bp)); //(기존에 할당되었던 곳의) 할당할 블록의 전체 사이즈
+    //c_size = find_fit 으로 받아온 메모리 size, a_size = 내가 할당하려고 하는 메모리 size
+
+    //할당블록은 freelist에서 지운다
+    removeBlock(bp);
 
     // csize에 asize를 쓰고도 4워드 이상 남는다면, 그 4워드를 나중에 또 쓸 수 있게 처리
     if ((c_size - a_size) >= (2 * (DSIZE))) {
@@ -273,10 +272,31 @@ static void place(void *bp, size_t a_size) {
         // 남은 블록에 header, footer 배치, 가용상태 처리
         PUT(HDRP(bp), PACK(c_size - a_size, 0));
         PUT(FTRP(bp), PACK(c_size - a_size, 0));
+        putFreeBlock(bp);// free list 첫번째에 분할된 블럭을 넣는다.
     }
     else {      // csize와 aszie 차이가 네 칸(4워드,16byte)보다 작다면 해당 블록 통째로 사용
         PUT(HDRP(bp), PACK(c_size, 1));
         PUT(FTRP(bp), PACK(c_size, 1));
+    }
+}
+
+// LIFO 방식으로 새로 반환되거나 생성된 가용 블록을 가용리스트 맨 앞에 추가
+void putFreeBlock(void *bp){
+    NEXT(bp) = free_listp; // 가용 블록 다음이 가용리스트 -> 맨 앞으로 보냄
+    PREV(bp) = NULL; // 맨 앞이니까 가용 블록의 prev는 null
+    PREV(free_listp) = bp; // 가용 리스트의 prev는 이제 가용 블록
+    free_listp = bp; // 가용리스트의 시작 주소를 가용 블록의 시작 주소로 바꿔줌
+}
+
+//free list 맨 앞에 프롤로그 블록이 존재
+void removeBlock(void *bp){
+    //첫 번째 블록을 없앨 때
+    if(bp == free_listp){
+        PREV(NEXT(bp)) = NULL; // (bp의 next 블록) 의 이전 블록은 이제 null이다. 즉 (bp의 next 블록)이 이제 시작 블록이다.
+        free_listp = NEXT(bp); // free_list의 시작 주소를 다음 블록의 시작 주소로 바꿔줌
+    } else { //첫 번째 블록이 아닐 때 블록 삭제
+        NEXT(PREV(bp)) = NEXT(bp);
+        PREV(NEXT(bp)) = PREV(bp);
     }
 }
 
@@ -301,18 +321,24 @@ void *mm_realloc(void *bp, size_t size)
     void *old_bp = bp;
     void *new_bp;
     size_t copySize;
+
+    if (size <= (GET_SIZE(HDRP(bp))-DSIZE)){ // 요청한 size가 더 작으면 그냥 원래 그대로 리턴(확장x)
+        return bp;
+    }
+    if (GET_ALLOC(HDRP(NEXT_BLKP(bp))) == 0 && (GET_SIZE(HDRP(bp))-DSIZE) + GET_SIZE(HDRP(NEXT_BLKP(bp))) > size){ // 맨 앞 가용블록이 size보다 작으면 그 뒤 가용 블록과 연결 처리
+        //다음 블록이 가용 블록이고 && (현재 가용 블록 사이즈 + 다음 블록의 사이즈)가 size 보다 크면 (즉 병합 가능할 때)
+        removeBlock(NEXT_BLKP(bp)); //다음 가용 메모리의 연결을 끊고(없다 처리하고)
+        size_t sum = GET_SIZE(HDRP(bp)) + GET_SIZE(HDRP(NEXT_BLKP(bp))); // 현재 블록과 다음 가용 블록을 연결
+        PUT(HDRP(bp), PACK(sum,1));
+        PUT(FTRP(bp), PACK(sum,1));
+        return bp;
+    }
     
     new_bp = mm_malloc(size); // 말록으로부터 새로운 메모리를 할당 받아 온 후 (bp 리턴)
     if (new_bp == NULL)
       return NULL;
     copySize = GET_SIZE(HDRP(old_bp)); // 기존 블록의 size를 copysize에 저장
-    if (size < copySize) //기존 블록의 size가 추가 요청한 size보다 크다면
-      copySize = size; // 기존 블록보다 작더라도 요청한 크기만큼 새 메모리를 쓰겠다 => 나머지는 버려짐
-    //요청한 size가 기존 블록size보다 크다면 그대로 요청한 size 사용 
     memcpy(new_bp, old_bp, copySize);  // 메모리의 특정한 부분으로부터 얼마까지의 부분을 다른 메모리 영역으로 복사해주는 함수(old_bp로부터 copySize만큼의 문자를 new_bp로 복사해라)
     mm_free(old_bp); // 이전 블록은 해제
     return new_bp; 
 }
-
-
-//여기서 이제 새로운 블록을 할당받아 옮기는 방법 대신 기존 메모리를 확장시키는 방법을 생각해 볼 만 함.
